@@ -16,6 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -36,6 +39,44 @@ const (
 	defaultBackoffMinMS    = 100
 	defaultBackoffMaxMS    = 2000
 	defaultCommitIntervalS = 1
+	defaultMetricsPort     = "9093"
+)
+
+var (
+	driftMessagesConsumedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "drift_monitor_messages_consumed_total",
+		Help: "Total messages consumed by drift-monitor.",
+	})
+	driftMessagesPublishedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "drift_monitor_messages_published_total",
+		Help: "Total scored messages published by drift-monitor by decision.",
+	}, []string{"decision"})
+	driftProcessingErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "drift_monitor_processing_errors_total",
+		Help: "Total processing errors in drift-monitor.",
+	})
+	driftCommitErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "drift_monitor_kafka_commit_errors_total",
+		Help: "Total Kafka commit errors in drift-monitor.",
+	})
+	driftPublishFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "drift_monitor_kafka_publish_failures_total",
+		Help: "Total failed Kafka publish attempts in drift-monitor.",
+	})
+	driftPredictFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "drift_monitor_model_predict_failures_total",
+		Help: "Total failed model-service /predict attempts in drift-monitor.",
+	})
+	driftProcessingDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "drift_monitor_processing_duration_seconds",
+		Help:    "Duration of drift-monitor processing per message.",
+		Buckets: prometheus.DefBuckets,
+	})
+	driftPredictDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "drift_monitor_model_predict_duration_seconds",
+		Help:    "Duration of model-service /predict calls from drift-monitor.",
+		Buckets: prometheus.DefBuckets,
+	})
 )
 
 type config struct {
@@ -121,6 +162,7 @@ type job struct {
 
 func main() {
 	cfg := loadConfig()
+	metricsPort := getEnv("METRICS_PORT", defaultMetricsPort)
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.brokers,
@@ -157,6 +199,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	go startMetricsServer(ctx, metricsPort)
 
 	jobs := make(chan job, cfg.queueSize)
 	done := make(chan struct{}, cfg.workerCount)
@@ -186,6 +229,7 @@ func main() {
 			log.Printf("fetch failed: %v", err)
 			continue
 		}
+		driftMessagesConsumedTotal.Inc()
 
 		select {
 		case jobs <- job{msg: m}:
@@ -215,17 +259,24 @@ func worker(
 		cancel()
 
 		if err != nil {
+			driftProcessingErrorsTotal.Inc()
 			log.Printf("worker=%d process failed partition=%d offset=%d err=%v", id, j.msg.Partition, j.msg.Offset, err)
 			continue
 		}
 
 		if err := reader.CommitMessages(ctx, j.msg); err != nil {
+			driftCommitErrorsTotal.Inc()
 			log.Printf("worker=%d commit failed partition=%d offset=%d err=%v", id, j.msg.Partition, j.msg.Offset, err)
 		}
 	}
 }
 
 func processMessage(ctx context.Context, cfg config, writer *kafka.Writer, httpClient *http.Client, msg kafka.Message) error {
+	start := time.Now()
+	defer func() {
+		driftProcessingDurationSeconds.Observe(time.Since(start).Seconds())
+	}()
+
 	enriched, err := decodeEnriched(msg.Value)
 	if err != nil {
 		return fmt.Errorf("decode enriched: %w", err)
@@ -241,8 +292,11 @@ func processMessage(ctx context.Context, cfg config, writer *kafka.Writer, httpC
 
 	var prediction predictResponse
 	err = retryExponential(ctx, cfg.maxAttempts, cfg.backoffMin, cfg.backoffMax, func(attempt int) error {
+		predictStart := time.Now()
 		res, callErr := callPredict(ctx, httpClient, cfg.modelServiceURL, request)
+		driftPredictDurationSeconds.Observe(time.Since(predictStart).Seconds())
 		if callErr != nil {
+			driftPredictFailuresTotal.Inc()
 			return callErr
 		}
 		prediction = res
@@ -286,12 +340,17 @@ func processMessage(ctx context.Context, cfg config, writer *kafka.Writer, httpC
 	}
 
 	err = retryExponential(ctx, cfg.maxAttempts, cfg.backoffMin, cfg.backoffMax, func(attempt int) error {
-		return writer.WriteMessages(ctx, out)
+		publishErr := writer.WriteMessages(ctx, out)
+		if publishErr != nil {
+			driftPublishFailuresTotal.Inc()
+		}
+		return publishErr
 	})
 	if err != nil {
 		return fmt.Errorf("publish failed after retries: %w", err)
 	}
 
+	driftMessagesPublishedTotal.WithLabelValues(scored.Decision).Inc()
 	log.Printf("scored transaction_id=%s risk_score=%.4f anomaly=%t", scored.TransactionID, scored.RiskScore, scored.IsAnomaly)
 	return nil
 }
@@ -497,5 +556,31 @@ func loadConfig() config {
 func waitWorkers(done <-chan struct{}, count int) {
 	for i := 0; i < count; i++ {
 		<-done
+	}
+}
+
+func startMetricsServer(ctx context.Context, port string) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("metrics server failed: %v", err)
 	}
 }

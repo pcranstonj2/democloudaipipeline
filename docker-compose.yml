@@ -75,6 +75,7 @@ services:
       KAFKA_OUTPUT_TOPIC: enriched-transactions
       KAFKA_GROUP_ID: enrichment-service
       PROCESS_TIMEOUT_SECONDS: 10
+      METRICS_PORT: 9090
     restart: unless-stopped
     networks:
       - pipeline
@@ -100,6 +101,7 @@ services:
       RETRY_MAX_ATTEMPTS: 5
       RETRY_BACKOFF_MIN_MS: 100
       RETRY_BACKOFF_MAX_MS: 2000
+      METRICS_PORT: 9091
     restart: unless-stopped
     networks:
       - pipeline
@@ -125,6 +127,43 @@ services:
       RETRY_MAX_ATTEMPTS: 5
       RETRY_BACKOFF_MIN_MS: 100
       RETRY_BACKOFF_MAX_MS: 2000
+      METRICS_PORT: 9093
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    depends_on:
+      - ingestion-service
+      - enrichment-service
+      - model-service
+      - scoring-orchestrator
+      - drift-monitor
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./infrastructure/grafana/provisioning/dashboards/transaction-scoring-provider.yml:/etc/grafana/provisioning/dashboards/transaction-scoring-provider.yml:ro
+      - ./infrastructure/grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./infrastructure/grafana/transaction-scoring-dashboard.json:/var/lib/grafana/dashboards/transaction-scoring-dashboard.json:ro
     restart: unless-stopped
     networks:
       - pipeline

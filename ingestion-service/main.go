@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -50,6 +53,30 @@ type server struct {
 	topic  string
 }
 
+var (
+	transactionRequestsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ingestion_transaction_requests_total",
+		Help: "Total number of /transaction requests received.",
+	})
+	transactionRequestFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ingestion_transaction_request_failures_total",
+		Help: "Total number of failed /transaction requests by stage.",
+	}, []string{"stage"})
+	transactionRequestDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ingestion_transaction_request_duration_seconds",
+		Help:    "Latency of /transaction request handling.",
+		Buckets: prometheus.DefBuckets,
+	})
+	kafkaPublishSuccessTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ingestion_kafka_publish_success_total",
+		Help: "Total number of successful Kafka publishes.",
+	})
+	kafkaPublishFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ingestion_kafka_publish_failures_total",
+		Help: "Total number of failed Kafka publishes.",
+	})
+)
+
 func main() {
 	kafkaBrokers := getEnv("KAFKA_BROKERS", defaultKafkaBrokers)
 	kafkaTopic := getEnv("KAFKA_TOPIC", defaultKafkaTopic)
@@ -76,6 +103,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /transaction", s.handleTransaction)
 	mux.HandleFunc("/healthz", handleHealthz)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	httpServer := &http.Server{
 		Addr:              ":" + port,
@@ -93,17 +121,25 @@ func main() {
 }
 
 func (s *server) handleTransaction(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	transactionRequestsTotal.Inc()
+	defer func() {
+		transactionRequestDurationSeconds.Observe(time.Since(start).Seconds())
+	}()
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
 	var req transactionRequest
 	if err := decodeAndValidateRequest(r, &req); err != nil {
+		transactionRequestFailuresTotal.WithLabelValues("validation").Inc()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	eventTime, err := time.Parse(time.RFC3339, req.Timestamp)
 	if err != nil {
+		transactionRequestFailuresTotal.WithLabelValues("timestamp_parse").Inc()
 		writeError(w, http.StatusBadRequest, "timestamp must be RFC3339 format")
 		return
 	}
@@ -121,6 +157,7 @@ func (s *server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 
 	payload, err := json.Marshal(event)
 	if err != nil {
+		transactionRequestFailuresTotal.WithLabelValues("serialize").Inc()
 		writeError(w, http.StatusInternalServerError, "failed to serialize event")
 		return
 	}
@@ -136,10 +173,13 @@ func (s *server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.writer.WriteMessages(ctx, msg); err != nil {
+		kafkaPublishFailuresTotal.Inc()
+		transactionRequestFailuresTotal.WithLabelValues("kafka_publish").Inc()
 		log.Printf("kafka publish failed, transaction_id=%s err=%v", event.TransactionID, err)
 		writeError(w, http.StatusServiceUnavailable, "failed to publish transaction")
 		return
 	}
+	kafkaPublishSuccessTotal.Inc()
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":         "accepted",

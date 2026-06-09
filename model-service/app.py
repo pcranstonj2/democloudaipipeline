@@ -1,10 +1,13 @@
 import os
+import time
 from pathlib import Path
 from typing import List
 
 import joblib
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "isolation_forest.joblib"
@@ -29,6 +32,16 @@ class PredictResponse(BaseModel):
 
 _model_bundle = None
 
+model_predict_requests_total = Counter(
+    "model_predict_requests_total",
+    "Total number of model predict requests by outcome.",
+    ["outcome"],
+)
+model_predict_latency_seconds = Histogram(
+    "model_predict_latency_seconds",
+    "Latency of model /predict endpoint.",
+)
+
 
 def load_model_bundle():
     global _model_bundle
@@ -42,6 +55,7 @@ def load_model_bundle():
 @app.on_event("startup")
 def startup_event() -> None:
     load_model_bundle()
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 @app.get("/healthz")
@@ -51,30 +65,37 @@ def healthz() -> dict:
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(payload: PredictRequest) -> PredictResponse:
-    if _model_bundle is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded")
+    start_time = time.perf_counter()
+    outcome = "error"
+    try:
+        if _model_bundle is None:
+            raise HTTPException(status_code=503, detail="Model is not loaded")
 
-    model = _model_bundle["model"]
-    model_version = _model_bundle.get("version", "unknown")
+        model = _model_bundle["model"]
+        model_version = _model_bundle.get("version", "unknown")
 
-    features: List[float] = [
-        payload.amount,
-        float(payload.velocity_1m),
-        float(payload.velocity_5m),
-        payload.device_risk_score,
-        payload.geo_risk_score,
-    ]
+        features: List[float] = [
+            payload.amount,
+            float(payload.velocity_1m),
+            float(payload.velocity_5m),
+            payload.device_risk_score,
+            payload.geo_risk_score,
+        ]
 
-    x = np.array([features], dtype=float)
+        x = np.array([features], dtype=float)
 
-    score_sample = float(model.score_samples(x)[0])
-    is_anomaly = bool(model.predict(x)[0] == -1)
+        score_sample = float(model.score_samples(x)[0])
+        is_anomaly = bool(model.predict(x)[0] == -1)
 
-    # Lower score_samples values indicate more anomalous points; map to 0..1 risk.
-    risk_score = float(1.0 / (1.0 + np.exp(5.0 * score_sample)))
+        # Lower score_samples values indicate more anomalous points; map to 0..1 risk.
+        risk_score = float(1.0 / (1.0 + np.exp(5.0 * score_sample)))
 
-    return PredictResponse(
-        risk_score=round(risk_score, 6),
-        is_anomaly=is_anomaly,
-        model_version=model_version,
-    )
+        outcome = "success"
+        return PredictResponse(
+            risk_score=round(risk_score, 6),
+            is_anomaly=is_anomaly,
+            model_version=model_version,
+        )
+    finally:
+        model_predict_requests_total.labels(outcome=outcome).inc()
+        model_predict_latency_seconds.observe(time.perf_counter() - start_time)

@@ -16,6 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -35,6 +38,44 @@ const (
 	defaultRetryBackoffMinMS   = 100
 	defaultRetryBackoffMaxMS   = 2000
 	defaultReaderCommitSeconds = 1
+	defaultMetricsPort         = "9091"
+)
+
+var (
+	scoringMessagesConsumedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scoring_messages_consumed_total",
+		Help: "Total messages consumed by scoring-orchestrator.",
+	})
+	scoringMessagesPublishedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "scoring_messages_published_total",
+		Help: "Total scored messages published by decision.",
+	}, []string{"decision"})
+	scoringProcessingErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scoring_processing_errors_total",
+		Help: "Total processing errors in scoring-orchestrator.",
+	})
+	scoringCommitErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scoring_kafka_commit_errors_total",
+		Help: "Total Kafka commit errors in scoring-orchestrator.",
+	})
+	scoringPublishFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scoring_kafka_publish_failures_total",
+		Help: "Total failed Kafka publish attempts in scoring-orchestrator.",
+	})
+	scoringPredictFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scoring_model_predict_failures_total",
+		Help: "Total failed model-service /predict attempts in scoring-orchestrator.",
+	})
+	scoringProcessingDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "scoring_processing_duration_seconds",
+		Help:    "Duration of end-to-end scoring processing per message.",
+		Buckets: prometheus.DefBuckets,
+	})
+	scoringPredictDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "scoring_model_predict_duration_seconds",
+		Help:    "Duration of model-service /predict calls from scoring-orchestrator.",
+		Buckets: prometheus.DefBuckets,
+	})
 )
 
 type config struct {
@@ -120,6 +161,7 @@ type job struct {
 
 func main() {
 	cfg := loadConfig()
+	metricsPort := getEnv("METRICS_PORT", defaultMetricsPort)
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.brokers,
@@ -156,6 +198,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	go startMetricsServer(ctx, metricsPort)
 
 	jobs := make(chan job, cfg.jobQueue)
 	workerDone := make(chan struct{}, cfg.workerCount)
@@ -187,6 +230,7 @@ func main() {
 			log.Printf("fetch failed: %v", err)
 			continue
 		}
+		scoringMessagesConsumedTotal.Inc()
 
 		select {
 		case jobs <- job{message: msg}:
@@ -216,11 +260,13 @@ func worker(
 		cancel()
 
 		if err != nil {
+			scoringProcessingErrorsTotal.Inc()
 			log.Printf("worker=%d process failed partition=%d offset=%d err=%v", id, j.message.Partition, j.message.Offset, err)
 			continue
 		}
 
 		if err := reader.CommitMessages(ctx, j.message); err != nil {
+			scoringCommitErrorsTotal.Inc()
 			log.Printf("worker=%d commit failed partition=%d offset=%d err=%v", id, j.message.Partition, j.message.Offset, err)
 			continue
 		}
@@ -228,6 +274,11 @@ func worker(
 }
 
 func processOne(ctx context.Context, cfg config, writer *kafka.Writer, httpClient *http.Client, msg kafka.Message) error {
+	start := time.Now()
+	defer func() {
+		scoringProcessingDurationSeconds.Observe(time.Since(start).Seconds())
+	}()
+
 	enriched, err := decodeEnriched(msg.Value)
 	if err != nil {
 		return fmt.Errorf("decode enriched event: %w", err)
@@ -243,8 +294,11 @@ func processOne(ctx context.Context, cfg config, writer *kafka.Writer, httpClien
 
 	var predictRes predictResponse
 	err = retryWithExponentialBackoff(ctx, cfg.maxRetryAttempts, cfg.backoffMin, cfg.backoffMax, func(attempt int) error {
+		predictStart := time.Now()
 		res, predictErr := callModelPredict(ctx, httpClient, cfg.modelServiceURL, predictReq)
+		scoringPredictDurationSeconds.Observe(time.Since(predictStart).Seconds())
 		if predictErr != nil {
+			scoringPredictFailuresTotal.Inc()
 			return predictErr
 		}
 		predictRes = res
@@ -288,12 +342,17 @@ func processOne(ctx context.Context, cfg config, writer *kafka.Writer, httpClien
 	}
 
 	err = retryWithExponentialBackoff(ctx, cfg.maxRetryAttempts, cfg.backoffMin, cfg.backoffMax, func(attempt int) error {
-		return writer.WriteMessages(ctx, outMsg)
+		publishErr := writer.WriteMessages(ctx, outMsg)
+		if publishErr != nil {
+			scoringPublishFailuresTotal.Inc()
+		}
+		return publishErr
 	})
 	if err != nil {
 		return fmt.Errorf("publish scored event failed after retries: %w", err)
 	}
 
+	scoringMessagesPublishedTotal.WithLabelValues(scored.Decision).Inc()
 	log.Printf("scored transaction_id=%s risk_score=%.4f anomaly=%t model=%s", scored.TransactionID, scored.RiskScore, scored.IsAnomaly, scored.ModelVersion)
 	return nil
 }
@@ -503,5 +562,31 @@ func loadConfig() config {
 func waitForWorkers(done <-chan struct{}, count int) {
 	for i := 0; i < count; i++ {
 		<-done
+	}
+}
+
+func startMetricsServer(ctx context.Context, port string) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("metrics server failed: %v", err)
 	}
 }

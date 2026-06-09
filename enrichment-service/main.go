@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -16,6 +17,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -25,10 +29,39 @@ const (
 	defaultOutputTopic       = "enriched-transactions"
 	defaultConsumerGroup     = "enrichment-service"
 	defaultProcessTimeoutSec = 10
+	defaultMetricsPort       = "9090"
 
 	producerMaxAttempts = 10
 	producerBackoffMin  = 100 * time.Millisecond
 	producerBackoffMax  = 1 * time.Second
+)
+
+var (
+	enrichmentMessagesConsumedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "enrichment_messages_consumed_total",
+		Help: "Total messages consumed by enrichment-service.",
+	})
+	enrichmentMessagesPublishedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "enrichment_messages_published_total",
+		Help: "Total messages published by enrichment-service.",
+	})
+	enrichmentProcessingErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "enrichment_processing_errors_total",
+		Help: "Total processing errors in enrichment-service.",
+	})
+	enrichmentKafkaPublishFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "enrichment_kafka_publish_failures_total",
+		Help: "Total Kafka publish failures in enrichment-service.",
+	})
+	enrichmentKafkaCommitErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "enrichment_kafka_commit_errors_total",
+		Help: "Total Kafka commit errors in enrichment-service.",
+	})
+	enrichmentProcessingDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "enrichment_processing_duration_seconds",
+		Help:    "Processing duration for enrichment-service messages.",
+		Buckets: prometheus.DefBuckets,
+	})
 )
 
 type rawTransactionEvent struct {
@@ -120,6 +153,7 @@ func main() {
 	outputTopic := getEnv("KAFKA_OUTPUT_TOPIC", defaultOutputTopic)
 	groupID := getEnv("KAFKA_GROUP_ID", defaultConsumerGroup)
 	processTimeout := time.Duration(getEnvInt("PROCESS_TIMEOUT_SECONDS", defaultProcessTimeoutSec)) * time.Second
+	metricsPort := getEnv("METRICS_PORT", defaultMetricsPort)
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
@@ -156,6 +190,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	go startMetricsServer(ctx, metricsPort)
 
 	log.Printf("enrichment service started group=%s input_topic=%s output_topic=%s brokers=%s", groupID, inputTopic, outputTopic, strings.Join(brokers, ","))
 
@@ -176,13 +211,16 @@ func main() {
 			log.Printf("fetch failed: %v", err)
 			continue
 		}
+		enrichmentMessagesConsumedTotal.Inc()
 
 		if err := processMessage(ctx, writer, tracker, outputTopic, msg, processTimeout); err != nil {
+			enrichmentProcessingErrorsTotal.Inc()
 			log.Printf("process failed topic=%s partition=%d offset=%d err=%v", msg.Topic, msg.Partition, msg.Offset, err)
 			continue
 		}
 
 		if err := reader.CommitMessages(ctx, msg); err != nil {
+			enrichmentKafkaCommitErrorsTotal.Inc()
 			log.Printf("commit failed topic=%s partition=%d offset=%d err=%v", msg.Topic, msg.Partition, msg.Offset, err)
 			continue
 		}
@@ -190,6 +228,11 @@ func main() {
 }
 
 func processMessage(parent context.Context, writer *kafka.Writer, tracker *velocityTracker, outputTopic string, msg kafka.Message, timeout time.Duration) error {
+	start := time.Now()
+	defer func() {
+		enrichmentProcessingDurationSeconds.Observe(time.Since(start).Seconds())
+	}()
+
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
@@ -221,8 +264,10 @@ func processMessage(parent context.Context, writer *kafka.Writer, tracker *veloc
 	}
 
 	if err := writer.WriteMessages(ctx, out); err != nil {
+		enrichmentKafkaPublishFailuresTotal.Inc()
 		return fmt.Errorf("publish enriched event: %w", err)
 	}
+	enrichmentMessagesPublishedTotal.Inc()
 
 	log.Printf("enriched transaction_id=%s customer_id=%s velocity_1m=%d velocity_5m=%d high_velocity=%t", enriched.TransactionID, enriched.CustomerID, enriched.Velocity.Window1mCount, enriched.Velocity.Window5mCount, enriched.Velocity.HighVelocity)
 	return nil
@@ -343,4 +388,30 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func startMetricsServer(ctx context.Context, port string) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("metrics server failed: %v", err)
+	}
 }
