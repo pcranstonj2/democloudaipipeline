@@ -179,6 +179,7 @@ func main() {
 	}()
 
 	writer := &kafka.Writer{
+		// Keep topic on the writer only; setting it on both writer and message causes a runtime error.
 		Addr:            kafka.TCP(cfg.brokers...),
 		Topic:           cfg.outputTopic,
 		Balancer:        &kafka.Hash{},
@@ -330,8 +331,8 @@ func processOne(ctx context.Context, cfg config, writer *kafka.Writer, httpClien
 		return fmt.Errorf("marshal scored event: %w", err)
 	}
 
+	// Do not set Topic here because writer.Topic is already configured.
 	outMsg := kafka.Message{
-		Topic: cfg.outputTopic,
 		Key:   []byte(scored.TransactionID),
 		Value: payload,
 		Time:  time.Now().UTC(),

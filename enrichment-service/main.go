@@ -171,6 +171,7 @@ func main() {
 	}()
 
 	writer := &kafka.Writer{
+		// Keep topic on the writer only; setting it on both writer and message causes a runtime error.
 		Addr:            kafka.TCP(brokers...),
 		Topic:           outputTopic,
 		Balancer:        &kafka.Hash{},
@@ -252,8 +253,8 @@ func processMessage(parent context.Context, writer *kafka.Writer, tracker *veloc
 		traceID = "missing"
 	}
 
+	// Do not set Topic here because writer.Topic is already configured.
 	out := kafka.Message{
-		Topic: outputTopic,
 		Key:   []byte(enriched.TransactionID),
 		Value: payload,
 		Time:  time.Now().UTC(),
