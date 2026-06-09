@@ -1,0 +1,134 @@
+version: "3.9"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "29092:29092"
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  model-service:
+    build:
+      context: ./model-service
+      dockerfile: Dockerfile
+    container_name: model-service
+    ports:
+      - "8010:8010"
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  ingestion-service:
+    build:
+      context: ./ingestion-service
+      dockerfile: Dockerfile
+    container_name: ingestion-service
+    depends_on:
+      - kafka
+    environment:
+      PORT: 8080
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: raw-transactions
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  enrichment-service:
+    build:
+      context: ./enrichment-service
+      dockerfile: Dockerfile
+    container_name: enrichment-service
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_INPUT_TOPIC: raw-transactions
+      KAFKA_OUTPUT_TOPIC: enriched-transactions
+      KAFKA_GROUP_ID: enrichment-service
+      PROCESS_TIMEOUT_SECONDS: 10
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  scoring-orchestrator:
+    build:
+      context: ./scoring-orchestrator
+      dockerfile: Dockerfile
+    container_name: scoring-orchestrator
+    depends_on:
+      - kafka
+      - model-service
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_INPUT_TOPIC: enriched-transactions
+      KAFKA_OUTPUT_TOPIC: scored-transactions
+      KAFKA_GROUP_ID: scoring-orchestrator
+      MODEL_SERVICE_URL: http://model-service:8010/predict
+      WORKER_COUNT: 8
+      JOB_QUEUE_SIZE: 1024
+      PROCESS_TIMEOUT_SECONDS: 15
+      HTTP_TIMEOUT_SECONDS: 3
+      RETRY_MAX_ATTEMPTS: 5
+      RETRY_BACKOFF_MIN_MS: 100
+      RETRY_BACKOFF_MAX_MS: 2000
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  drift-monitor:
+    build:
+      context: ./drift-monitor
+      dockerfile: Dockerfile
+    container_name: drift-monitor
+    depends_on:
+      - kafka
+      - model-service
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_INPUT_TOPIC: enriched-transactions
+      KAFKA_OUTPUT_TOPIC: scored-transactions
+      KAFKA_GROUP_ID: drift-monitor-scorer
+      MODEL_SERVICE_URL: http://model-service:8010/predict
+      WORKER_COUNT: 4
+      JOB_QUEUE_SIZE: 512
+      PROCESS_TIMEOUT_SECONDS: 15
+      HTTP_TIMEOUT_SECONDS: 3
+      RETRY_MAX_ATTEMPTS: 5
+      RETRY_BACKOFF_MIN_MS: 100
+      RETRY_BACKOFF_MAX_MS: 2000
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+networks:
+  pipeline:
+    driver: bridge

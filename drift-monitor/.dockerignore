@@ -1,0 +1,23 @@
+# VCS and editor artifacts
+.git
+.gitignore
+.vscode
+
+# Build artifacts
+*.exe
+*.out
+*.test
+bin/
+build/
+dist/
+
+# Go caches
+.gocache/
+
+# Environment files
+.env
+.env.*
+
+# Docs and local notes
+README.md
+*.md

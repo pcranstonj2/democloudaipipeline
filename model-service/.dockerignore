@@ -1,0 +1,20 @@
+# VCS and editor artifacts
+.git
+.gitignore
+.vscode
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local files
+.env
+.env.*
+README.md
+*.md
