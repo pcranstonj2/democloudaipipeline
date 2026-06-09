@@ -14,6 +14,7 @@ DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "isolation_for
 MODEL_PATH = Path(os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH)))
 
 app = FastAPI(title="Model Service", version="1.0.0")
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 class PredictRequest(BaseModel):
@@ -55,7 +56,6 @@ def load_model_bundle():
 @app.on_event("startup")
 def startup_event() -> None:
     load_model_bundle()
-    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 @app.get("/healthz")
