@@ -2,7 +2,10 @@ param(
     [string]$Uri = "http://localhost:8080/transaction",
     [string]$InputFile = ".\data\test-transactions.txt",
     [int]$DelayMs = 0,
-    [switch]$StopOnError
+    [switch]$StopOnError,
+    [switch]$Quiet,
+    [int]$ProgressEvery = 100,
+    [switch]$ShowResponse
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,17 +29,23 @@ Get-Content -Path $InputFile | ForEach-Object {
         $response = Invoke-RestMethod -Method POST -Uri $Uri -Headers $headers -Body $line
         $sent++
 
-        $txId = ""
-        try {
-            $txId = (ConvertFrom-Json -InputObject $line).transaction_id
-        }
-        catch {
-            $txId = "<unknown>"
+        if (-not $Quiet) {
+            $txId = ""
+            try {
+                $txId = (ConvertFrom-Json -InputObject $line).transaction_id
+            }
+            catch {
+                $txId = "<unknown>"
+            }
+
+            Write-Host "[$sent] Sent transaction: $txId"
+            if ($ShowResponse -and $null -ne $response) {
+                Write-Host "      Response: $($response | ConvertTo-Json -Compress)"
+            }
         }
 
-        Write-Host "[$sent] Sent transaction: $txId"
-        if ($null -ne $response) {
-            Write-Host "      Response: $($response | ConvertTo-Json -Compress)"
+        if ($Quiet -and $ProgressEvery -gt 0 -and ($sent % $ProgressEvery -eq 0)) {
+            Write-Host "Progress: Sent=$sent Failed=$failed"
         }
     }
     catch {
