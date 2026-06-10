@@ -193,6 +193,60 @@ Resources included:
 
 Note: Image names in manifests use local tags (for example ingestion-service:latest). Update these to your registry for shared clusters.
 
+## Azure AKS Deployment
+
+This repository includes a PowerShell helper script to provision Azure infrastructure,
+build service images into ACR, and deploy the Kubernetes manifest to AKS.
+
+Script location:
+
+- infrastructure/azure/deploy-aks.ps1
+
+### Prerequisites
+
+- Azure CLI logged in (`az login`)
+- kubectl installed
+- Permissions to create Resource Group, ACR, and AKS resources
+
+### One-command deployment
+
+From the repository root in PowerShell:
+
+```powershell
+.\infrastructure\azure\deploy-aks.ps1 `
+	-ResourceGroup rg-transaction-pipeline `
+	-Location eastus `
+	-AksName aks-transaction-pipeline `
+	-AcrName acrtxpipeline
+```
+
+What the script does:
+
+1. Creates resource group, ACR, and AKS (unless skipped).
+2. Builds and pushes service images to ACR.
+3. Rewrites local image tags in the Kubernetes manifest to ACR image URLs.
+4. Applies the manifest to AKS.
+5. Patches `ingestion-service` to `LoadBalancer` for external access.
+
+### Optional script flags
+
+- `-SkipInfrastructure`: use an existing AKS and ACR.
+- `-SkipImageBuild`: skip ACR builds and deploy using existing tags.
+- `-Namespace`: override default namespace (`transaction-pipeline`).
+
+### Get the public ingestion endpoint
+
+```bash
+kubectl get service ingestion-service -n transaction-pipeline
+```
+
+Use the returned external IP with port 8080.
+
+### Secrets template
+
+Use the template at `infrastructure/azure/app-secrets-template.yaml` to keep sensitive values
+out of ConfigMaps as you introduce credentials.
+
 ## Grafana Dashboard Auto-Loading
 
 Dashboard assets:
