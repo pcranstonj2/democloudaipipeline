@@ -379,8 +379,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(rate(http_server_requests_seconds_count{service=~\"ingestion-service|model-service\"}[5m]))",
-          "legendFormat": "requests/sec",
+          "expr": "sum(rate(ingestion_transaction_requests_total[5m])) + sum(rate(model_predict_requests_total[5m]))",
+          "legendFormat": "pipeline requests/sec",
           "range": true,
           "refId": "A"
         }
@@ -528,7 +528,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(rate(scored_transactions_total{decision=\"deny\"}[5m])) / clamp_min(sum(rate(scored_transactions_total[5m])), 1)",
+          "expr": "sum(rate(scoring_messages_published_total{decision=\"deny\"}[5m])) / clamp_min(sum(rate(scoring_messages_published_total[5m])), 1)",
           "legendFormat": "deny ratio",
           "range": true,
           "refId": "A"
@@ -595,7 +595,7 @@
       "type": "stat"
     }
   ],
-  "refresh": "15s",
+  "refresh": "1s",
   "schemaVersion": 39,
   "style": "dark",
   "tags": [

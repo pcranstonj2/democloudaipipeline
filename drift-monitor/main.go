@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,7 +79,108 @@ var (
 		Help:    "Duration of model-service /predict calls from drift-monitor.",
 		Buckets: prometheus.DefBuckets,
 	})
+	driftPSI = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "drift_psi",
+		Help: "Population Stability Index by feature comparing observed stream to baseline distribution.",
+	}, []string{"feature"})
+	psiState = newPSIState()
 )
+
+type psiFeatureConfig struct {
+	bounds   []float64
+	baseline []float64
+}
+
+type psiFeatureState struct {
+	counts []int
+	total  int
+}
+
+type streamingPSIState struct {
+	mu       sync.Mutex
+	configs  map[string]psiFeatureConfig
+	features map[string]*psiFeatureState
+}
+
+func newPSIState() *streamingPSIState {
+	configs := map[string]psiFeatureConfig{
+		"amount": {
+			bounds:   []float64{50, 100, 250, 500, 1000},
+			baseline: []float64{0.30, 0.25, 0.20, 0.15, 0.07, 0.03},
+		},
+		"velocity_1m": {
+			bounds:   []float64{1, 2, 4, 8},
+			baseline: []float64{0.55, 0.23, 0.14, 0.06, 0.02},
+		},
+		"velocity_5m": {
+			bounds:   []float64{2, 5, 10, 20},
+			baseline: []float64{0.45, 0.25, 0.16, 0.10, 0.04},
+		},
+		"device_risk_score": {
+			bounds:   []float64{0.30, 0.60, 0.80},
+			baseline: []float64{0.60, 0.25, 0.10, 0.05},
+		},
+		"geo_risk_score": {
+			bounds:   []float64{0.25, 0.40, 0.60},
+			baseline: []float64{0.55, 0.30, 0.10, 0.05},
+		},
+	}
+
+	features := make(map[string]*psiFeatureState, len(configs))
+	for feature, cfg := range configs {
+		features[feature] = &psiFeatureState{counts: make([]int, len(cfg.baseline))}
+	}
+
+	return &streamingPSIState{
+		configs:  configs,
+		features: features,
+	}
+}
+
+func (s *streamingPSIState) observe(feature string, value float64) {
+	cfg, ok := s.configs[feature]
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, ok := s.features[feature]
+	if !ok {
+		state = &psiFeatureState{counts: make([]int, len(cfg.baseline))}
+		s.features[feature] = state
+	}
+
+	bucket := bucketIndex(value, cfg.bounds)
+	state.counts[bucket]++
+	state.total++
+
+	if state.total < 10 {
+		driftPSI.WithLabelValues(feature).Set(0)
+		return
+	}
+
+	const epsilon = 1e-6
+	psiValue := 0.0
+	for i, expected := range cfg.baseline {
+		observed := float64(state.counts[i]) / float64(state.total)
+		o := math.Max(observed, epsilon)
+		e := math.Max(expected, epsilon)
+		psiValue += (o - e) * math.Log(o/e)
+	}
+
+	driftPSI.WithLabelValues(feature).Set(psiValue)
+}
+
+func bucketIndex(value float64, bounds []float64) int {
+	for i, bound := range bounds {
+		if value <= bound {
+			return i
+		}
+	}
+	return len(bounds)
+}
 
 type config struct {
 	brokers []string
@@ -290,6 +393,11 @@ func processMessage(ctx context.Context, cfg config, writer *kafka.Writer, httpC
 		DeviceRiskScore: deviceRiskScore(enriched.Device.RiskLevel),
 		GeoRiskScore:    geoRiskScore(enriched.Geo.Country),
 	}
+	psiState.observe("amount", request.Amount)
+	psiState.observe("velocity_1m", float64(request.Velocity1m))
+	psiState.observe("velocity_5m", float64(request.Velocity5m))
+	psiState.observe("device_risk_score", request.DeviceRiskScore)
+	psiState.observe("geo_risk_score", request.GeoRiskScore)
 
 	var prediction predictResponse
 	err = retryExponential(ctx, cfg.maxAttempts, cfg.backoffMin, cfg.backoffMax, func(attempt int) error {

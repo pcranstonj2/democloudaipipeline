@@ -76,6 +76,11 @@ var (
 		Help:    "Duration of model-service /predict calls from scoring-orchestrator.",
 		Buckets: prometheus.DefBuckets,
 	})
+	transactionRiskScore = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "transaction_risk_score",
+		Help:    "Risk score distribution for scored transactions.",
+		Buckets: []float64{0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 1.0},
+	})
 )
 
 type config struct {
@@ -353,6 +358,7 @@ func processOne(ctx context.Context, cfg config, writer *kafka.Writer, httpClien
 		return fmt.Errorf("publish scored event failed after retries: %w", err)
 	}
 
+	transactionRiskScore.Observe(scored.RiskScore)
 	scoringMessagesPublishedTotal.WithLabelValues(scored.Decision).Inc()
 	log.Printf("scored transaction_id=%s risk_score=%.4f anomaly=%t model=%s", scored.TransactionID, scored.RiskScore, scored.IsAnomaly, scored.ModelVersion)
 	return nil
